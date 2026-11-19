@@ -18,6 +18,8 @@ A music bot you run on your own PC. Paste a YouTube link, a playlist, or just ty
 ### 1. Install Python
 Get **Python 3.10 or newer** from <https://www.python.org/downloads/>.
 > **Windows:** tick **"Add python.exe to PATH"** on the first screen of the installer!
+>
+> **macOS / Linux:** also install the Opus audio library: `brew install opus` (macOS) or `sudo apt install libopus0` (Debian/Ubuntu). Windows doesn't need this.
 
 ### 2. Create your bot on Discord
 1. Go to <https://discord.com/developers/applications> and click **New Application**. Give it a name (that's your bot's name).
@@ -58,6 +60,23 @@ Open it, pick your server and click **Authorize**. Then join a voice channel and
 
 > The bot runs while that window is open. Close it (or press Ctrl+C) to stop the bot.
 > Every time you start it, it also updates the YouTube downloader, which keeps YouTube working.
+
+---
+
+## ☁️ Hosting on Replit (instead of your PC)
+
+The project comes ready for Replit, so you don't need to change any code.
+
+1. On <https://replit.com>, click **Create Repl → Import from GitHub** and paste this repository's link.
+2. Open the **Secrets** tab (🔒 lock icon) and add a secret named **`DISCORD_TOKEN`** with your bot token as the value. On Replit, don't put the token in a file: anyone who opens your Repl could see it.
+3. Press **Run**. The first start takes a minute or two while it installs everything. Then the console shows the invite link, the same as on a PC.
+
+Optional settings from the [Settings table](#️-settings-env) (`GUILD_ID`, `DEFAULT_VOLUME`, ...) also go in **Secrets**.
+
+**Two things to know about Replit:**
+
+- **Keeping it online.** A normal Repl stops soon after you close the browser tab. To keep the bot on 24/7, click **Deploy** and pick **Reserved VM**. That's a paid Replit feature; the project already includes the deployment settings.
+- **YouTube is pickier on Replit.** Replit runs on cloud servers, and YouTube shows its *"Sign in to confirm you're not a bot"* check to those far more often than to a home PC. If you see that message, upload a `cookies.txt` file (see [Troubleshooting](#️-troubleshooting)) and add a secret `COOKIES_FILE` with the value `cookies.txt`. SoundCloud, Bandcamp and the other sites keep working either way.
 
 ---
 
@@ -137,6 +156,7 @@ Only people in the bot's voice channel can use the buttons. The panel always mov
 | `EMBED_COLOR` | `#8B5CF6` | Color of the bot's messages |
 | `COOKIES_FILE` | *(empty)* | YouTube cookies file (see below) |
 | `COOKIES_FROM_BROWSER` | *(empty)* | Read YouTube cookies from a browser: `firefox`, `chrome`, `edge`, ... |
+| `OPUS_LIBRARY` | *(empty)* | Full path to libopus, only if the bot says it can't find it |
 
 Restart the bot after changing settings.
 
@@ -155,7 +175,7 @@ This rarely happens on a home internet connection, but if it does, give the bot 
 Using a spare Google account for this is a good idea. Never share your cookies file.
 
 **The bot joins but there's no sound.**
-Make sure the bot has the **Connect** and **Speak** permissions in that channel and isn't server-muted. The console prints `Using FFmpeg: ...` at startup. If that line is missing, run the start script again.
+Make sure the bot has the **Connect** and **Speak** permissions in that channel and isn't server-muted. If the console says *"The Opus audio library was not found"*, install it: `brew install opus` (macOS) or `sudo apt install libopus0` (Linux). On Replit, `replit.nix` already handles this.
 
 **YouTube suddenly stopped working.**
 YouTube changes things often. Restart the bot: the start script automatically updates `yt-dlp`, which usually fixes it.
@@ -179,6 +199,7 @@ musicbot/player.py      one player per server: playback loop, controls, auto-lea
 musicbot/ui.py          embeds, live control panel, queue pages, search menu
 musicbot/cogs/music.py  all slash commands
 tests/                  unit tests:  python -m unittest
+.replit, replit.nix     Replit setup (run command, deployment, libopus + ffmpeg)
 ```
 
 Built with [discord.py](https://github.com/Rapptz/discord.py), [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [FFmpeg](https://ffmpeg.org/).

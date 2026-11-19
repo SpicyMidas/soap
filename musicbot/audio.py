@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -191,6 +193,55 @@ def find_ffmpeg() -> str:
             "FFmpeg was not found. Run the start script again (it installs it automatically) "
             "or install FFmpeg from https://ffmpeg.org/download.html"
         ) from exc
+
+
+_OPUS_DIRS = (
+    "/opt/homebrew/lib",  # macOS (Apple Silicon Homebrew)
+    "/usr/local/lib",  # macOS (Intel Homebrew) / manual installs
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+)
+
+
+def ensure_opus() -> bool:
+    """Load the Opus library discord.py needs to send voice.
+
+    Windows: bundled with discord.py. macOS/Linux: uses the system library, which
+    discord.py can't always find on its own (e.g. on Replit/Nix or Homebrew).
+    """
+    if discord.opus.is_loaded() or discord.opus._load_default():
+        return True
+
+    candidates: list[str] = []
+    if os.environ.get("OPUS_LIBRARY"):
+        candidates.append(os.environ["OPUS_LIBRARY"])
+    dirs: list[str] = []
+    for var in ("REPLIT_LD_LIBRARY_PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        dirs += [d for d in os.environ.get(var, "").split(os.pathsep) if d]
+    dirs += list(_OPUS_DIRS)
+    for d in dirs:
+        for pattern in ("libopus.so*", "libopus*.dylib"):
+            candidates += sorted(glob.glob(os.path.join(d, pattern)))
+
+    for path in candidates:
+        try:
+            discord.opus.load_opus(path)
+        except Exception:
+            continue
+        if discord.opus.is_loaded():
+            log.info("Loaded Opus from %s", path)
+            return True
+
+    log.error(
+        "The Opus audio library was not found, so the bot can't send music to voice channels!\n"
+        "    Linux (Debian/Ubuntu): sudo apt install libopus0\n"
+        "    macOS:                 brew install opus\n"
+        "    Replit:                make sure replit.nix contains pkgs.libopus\n"
+        "    Or set OPUS_LIBRARY in .env to the full path of libopus."
+    )
+    return False
 
 
 def find_js_runtimes() -> dict[str, dict[str, Any]]:

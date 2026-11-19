@@ -80,6 +80,7 @@ def load_config() -> Config:
             "\n[!] No bot token found.\n"
             f"    Open {ENV_FILE} and paste your token after DISCORD_TOKEN=\n"
             "    (Discord Developer Portal -> your application -> Bot -> Reset Token)\n"
+            "    On Replit: open the Secrets tab (lock icon) and add a secret named DISCORD_TOKEN.\n"
         )
         sys.exit(1)
 

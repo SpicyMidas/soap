@@ -14,3 +14,9 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# replit
+.pythonlibs/
+.upm/
+.cache/
+.local/

@@ -1,0 +1,16 @@
+# Replit configuration: press "Run" to start the bot.
+# Put your bot token in the Secrets tab as DISCORD_TOKEN (not in a file).
+entrypoint = "bot.py"
+modules = ["python-3.12"]
+
+# Installs/updates the requirements (keeps yt-dlp fresh for YouTube), then starts the bot.
+run = "pip install -q --disable-pip-version-check -U -r requirements.txt && python bot.py"
+
+[nix]
+channel = "stable-24_05"
+
+# "Deploy" -> Reserved VM keeps the bot online 24/7 after you close the tab.
+[deployment]
+deploymentTarget = "gce"
+build = ["sh", "-c", "pip install -q --disable-pip-version-check -U -r requirements.txt"]
+run = ["python", "bot.py"]

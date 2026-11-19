@@ -11,7 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..audio import FILTERS, ExtractionError, Extractor, Track, find_ffmpeg, format_duration, is_url, parse_timestamp
+from ..audio import FILTERS, ExtractionError, Extractor, Track, ensure_opus, find_ffmpeg, format_duration, is_url, parse_timestamp
 from ..config import Config
 from ..musicqueue import LoopMode, QueueFull
 from ..player import GuildPlayer
@@ -50,6 +50,7 @@ class Music(commands.Cog):
         self._ac_cache: OrderedDict[str, list[Track]] = OrderedDict()
         log.info("Using FFmpeg: %s", self.ffmpeg)
         log.info("Using JavaScript runtime for YouTube: %s", ", ".join(self.extractor.js_runtimes))
+        ensure_opus()
 
     async def cog_unload(self) -> None:
         for player in list(self.players.values()):
