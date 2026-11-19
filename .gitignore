@@ -1,0 +1,16 @@
+# secrets
+.env
+cookies.txt
+*.cookies.txt
+
+# python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

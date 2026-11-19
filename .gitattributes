@@ -1,0 +1,3 @@
+# Keep Windows line endings for the batch file and Unix ones for the shell script
+*.bat -text
+*.sh text eol=lf

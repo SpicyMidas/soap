@@ -1,0 +1,7 @@
+# Discord library with voice support (includes DAVE voice encryption, which Discord now requires)
+discord.py[voice]>=2.7.1
+# Finds and streams music from YouTube, SoundCloud, Bandcamp and 1000+ sites.
+# The "deno" extra installs the JavaScript runtime YouTube now needs.
+yt-dlp[default,deno]>=2026.10.26
+# A ready-to-use FFmpeg, so you don't have to install it yourself
+imageio-ffmpeg>=0.6.0
