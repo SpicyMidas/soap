@@ -11,7 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..audio import FILTERS, ExtractionError, Extractor, Track, find_ffmpeg, format_duration, is_url, parse_timestamp
+from ..audio import FILTERS, AudioCache, ExtractionError, Extractor, Track, find_ffmpeg, format_duration, is_url, parse_timestamp
 from ..config import Config
 from ..diagnostics import build_report, install_drop_counter, log_startup_checks
 from ..musicqueue import LoopMode, QueueFull
@@ -47,10 +47,13 @@ class Music(commands.Cog):
         self.extractor = Extractor(config)
         self.ffmpeg = find_ffmpeg()
         self.players: dict[int, GuildPlayer] = {}
+        self.cache = AudioCache()
+        self.download_sources: set[str] = set()  # sites whose streams failed, so we download instead
         self._voice_locks: dict[int, asyncio.Lock] = {}
         self._ac_cache: OrderedDict[str, list[Track]] = OrderedDict()
         log.info("Using FFmpeg: %s", self.ffmpeg)
         log.info("Using JavaScript runtime for YouTube: %s", ", ".join(self.extractor.js_runtimes))
+        log.info("Audio mode: %s", config.audio_mode)
         install_drop_counter()
         log_startup_checks()
 

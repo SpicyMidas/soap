@@ -56,6 +56,16 @@ def _bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on", "y"}
 
 
+def _choice(name: str, default: str, allowed: set[str]) -> str:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw not in allowed:
+        print(f"[config] {name}={raw!r} should be one of {', '.join(sorted(allowed))}; using {default}.")
+        return default
+    return raw
+
+
 def _color(raw: str, default: int) -> int:
     raw = raw.strip().lstrip("#")
     if not raw:
@@ -73,6 +83,7 @@ class Config:
     default_volume: int
     idle_timeout: int
     leave_when_done: bool
+    audio_mode: str
     max_queue_size: int
     cookies_file: str | None
     cookies_from_browser: str | None
@@ -112,6 +123,7 @@ def load_config() -> Config:
         default_volume=_int("DEFAULT_VOLUME", 80, 0, 200),
         idle_timeout=_int("IDLE_TIMEOUT", 300, 10),
         leave_when_done=_bool("LEAVE_WHEN_DONE", True),
+        audio_mode=_choice("AUDIO_MODE", "auto", {"auto", "stream", "download"}),
         max_queue_size=_int("MAX_QUEUE_SIZE", 500, 1),
         cookies_file=cookies_file,
         cookies_from_browser=os.environ.get("COOKIES_FROM_BROWSER", "").strip() or None,

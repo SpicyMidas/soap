@@ -5,11 +5,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import discord
 
-from .audio import FILTERS, AudioFilter, ExtractionError, Track, build_source
+from .audio import (
+    FILTERS,
+    AudioFilter,
+    ExtractionError,
+    StderrBuffer,
+    Track,
+    build_source,
+    describe_ffmpeg_error,
+    format_duration,
+    redact_links,
+)
 from .musicqueue import LoopMode, MusicQueue
 from .ui import NowPlayingPanel
 
@@ -20,6 +31,29 @@ log = logging.getLogger("musicbot.player")
 
 PANEL_REFRESH_SECONDS = 10
 LAST_ACTION_SHOW_SECONDS = 45
+EARLY_FAIL_SECONDS = 3.0  # a song that stops sooner than this didn't really play
+MIDSONG_MARGIN = 15  # stopping more than this many seconds before the end = the stream cut out
+
+_LABELS = {"stream": "Streaming", "stream-fresh": "Streaming (fresh link)", "download": "Downloading"}
+
+
+class VoiceLost(Exception):
+    """The voice connection went away and didn't come back."""
+
+
+@dataclass
+class _Attempt:
+    ok: bool
+    reason: str = ""
+    position: float = 0.0
+    voice_problem: bool = False
+    midsong: bool = False
+    details: str = ""
+
+
+def _tail(text: str, lines: int = 8) -> str:
+    rows = [r for r in redact_links(text).splitlines() if r.strip()]
+    return "\n".join("      " + r for r in rows[-lines:])
 
 
 class GuildPlayer:
@@ -59,6 +93,10 @@ class GuildPlayer:
         self._auto_paused = False
         self._alone_task: asyncio.Task | None = None
         self._leave_reason: str | None = None
+        self._play_error: Exception | None = None
+        self._last_track_failed = False
+        self._panel_for: Track | None = None
+        self._downloads: dict[int, asyncio.Task] = {}
         self.destroyed = False
 
         self.panel = NowPlayingPanel(self)
@@ -243,8 +281,7 @@ class GuildPlayer:
     # ------------------------------------------------------------- main loop
     def _after(self, error: Exception | None) -> None:
         # Runs in the audio thread, hand back to the event loop.
-        if error:
-            log.error("Player error in guild %s: %s", self.guild.id, error)
+        self._play_error = error
         self._loop.call_soon_threadsafe(self._track_done.set)
 
     async def _run(self) -> None:
@@ -258,6 +295,9 @@ class GuildPlayer:
                 await self._play(track)
         except asyncio.CancelledError:
             return
+        except VoiceLost:
+            log.warning("Lost the voice connection in guild %s and it didn't come back.", self.guild.id)
+            reason = "⚠️ I lost the connection to the voice channel. Use `/play` to try again."
         except Exception:
             log.exception("Player loop crashed in guild %s", self.guild.id)
             reason = "⚠️ Something went wrong with the player, so I left. Check the console for details."
@@ -278,7 +318,10 @@ class GuildPlayer:
 
             if self.config.leave_when_done and not self.stay and self.last_played is not None:
                 # The queue is done: leave right away (24/7 mode keeps the bot in the channel).
-                self._leave_reason = "✅ Finished playing, so I left the voice channel. Use `/play` to bring me back!"
+                if self._last_track_failed:
+                    self._leave_reason = "⚠️ The song couldn't be played (the error message says why), so I left the voice channel."
+                else:
+                    self._leave_reason = "✅ Finished playing, so I left the voice channel. Use `/play` to bring me back!"
                 return None
 
             await self.panel.show_idle()
@@ -301,28 +344,156 @@ class GuildPlayer:
             track.requester_name = "♾️ Autoplay"
         return track
 
-    async def _play(self, track: Track) -> None:
-        vc = self.vc
-        if not vc or not vc.is_connected():
-            self.queue.tracks.insert(0, track)
-            raise RuntimeError("Voice client disconnected")
-
-        try:
-            await self.extractor.resolve(track)
-        except ExtractionError as exc:
-            await self.send_notice(f"⚠️ Skipped **{discord.utils.escape_markdown(track.title)}** - {exc}")
-            return
-
-        self.current = track
-        self.last_played = track
-        position = 0.0
-        first = True
-        retried = False
-
+    # ------------------------------------------------------------ playback
+    async def _wait_for_voice(self, timeout: float = 15.0) -> discord.VoiceClient | None:
+        """Give a (re)connecting voice client a moment instead of failing right away."""
+        deadline = time.monotonic() + timeout
         while not self.destroyed:
             vc = self.vc
-            if not vc or not vc.is_connected():
+            if vc is None:
+                return None
+            if vc.is_connected():
+                return vc
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.25)
+        return None
+
+    def _plan(self, track: Track) -> list[str]:
+        """Which ways to get the audio, in order."""
+        mode = self.config.audio_mode
+        if track.is_live:
+            return ["stream", "stream-fresh"]
+        if mode == "stream":
+            return ["stream", "stream-fresh"]
+        if mode == "download" or track.source in self.cog.download_sources:
+            return ["download", "stream"]
+        return ["stream", "stream-fresh", "download"]
+
+    async def _download(self, track: Track) -> None:
+        task = self._downloads.get(id(track))
+        if task is None or (task.done() and not track.has_local_file):
+            task = asyncio.create_task(self.extractor.download(track, self.cog.cache))
+            self._downloads[id(track)] = task
+        try:
+            await asyncio.shield(task)
+        finally:
+            if task.done():
+                self._downloads.pop(id(track), None)
+
+    async def _prefetch(self, track: Track) -> None:
+        try:
+            await self._download(track)
+            log.info("Pre-downloaded the next song: %s", track.title)
+        except Exception as exc:
+            log.debug("Pre-download failed for %s: %s", track.title, exc)
+
+    async def _play(self, track: Track) -> None:
+        if await self._wait_for_voice() is None:
+            self.queue.tracks.insert(0, track)
+            raise VoiceLost()
+
+        self._last_track_failed = False
+        self._panel_for = None
+        self.last_played = track
+        failures: list[str] = []
+        plan = self._plan(track)
+        position = 0.0
+        resumed = False
+        index = 0
+        played_ok = False
+
+        while index < len(plan) and not self.destroyed:
+            how = plan[index]
+            use_local = how == "download"
+            if failures or resumed:
+                # Freeze the progress bar while we fetch the audio another way.
+                self._paused_at = time.monotonic()
+                if use_local:
+                    self.note("⏬ Streaming didn't work, downloading the song instead…")
+                    asyncio.create_task(self.panel.refresh())
+            try:
+                if use_local:
+                    await self._download(track)
+                else:
+                    if how == "stream-fresh":
+                        track.resolved_at = 0
+                    await self.extractor.resolve(track)
+            except ExtractionError as exc:
+                failures.append(f"{_LABELS[how]}: {exc}")
+                log.warning("%s failed for %s: %s", _LABELS[how], track.title, exc)
+                if not use_local:
+                    break  # yt-dlp couldn't even look the song up; other ways would fail the same way
+                index += 1
+                continue
+
+            self.current = track
+            self.last_played = track
+            log.info("Playing %s (%s)", track.title, "downloaded file" if use_local else "streaming")
+            if use_local and failures and self.config.audio_mode == "auto" and track.source not in self.cog.download_sources:
+                self.cog.download_sources.add(track.source)
+                log.warning(
+                    "Streaming from %s doesn't work on this connection, so the bot will download "
+                    "%s songs before playing them for the rest of this session.",
+                    track.source, track.source,
+                )
+            if use_local and self.queue and not track.is_live:
+                nxt = self.queue[0]
+                if not nxt.is_live and not nxt.has_local_file and id(nxt) not in self._downloads:
+                    asyncio.create_task(self._prefetch(nxt))
+
+            result = await self._play_attempt(track, use_local=use_local, position=position)
+            if result.ok:
+                played_ok = True
                 break
+
+            if result.midsong:
+                if resumed:
+                    log.warning("%s cut out again at %s, moving on.", track.title, format_duration(result.position))
+                    played_ok = True
+                    break
+                resumed = True
+                position = result.position
+                log.warning("%s cut out at %s (%s), resuming.", track.title, format_duration(position), result.reason)
+                if not use_local:
+                    track.resolved_at = 0
+                continue
+
+            if resumed:
+                log.warning("%s couldn't be resumed (%s), moving on.", track.title, result.reason)
+                played_ok = True
+                break
+            failures.append(f"{_LABELS[how]}: {result.reason}")
+            log.warning("%s failed for %s: %s%s", _LABELS[how], track.title, result.reason,
+                        f"\n    FFmpeg output:\n{result.details}" if result.details else "")
+            if result.voice_problem:
+                break  # another audio source won't help
+            position = result.position
+            index += 1
+
+        finished = self.current
+        self.current = None
+        self._paused_at = None
+        if not played_ok and not self.destroyed and failures:
+            self._last_track_failed = True
+            title = discord.utils.escape_markdown(track.title)
+            reasons = "\n".join(f"• {f}" for f in failures)
+            await self.send_notice(f"⚠️ Couldn't play **{title}**\n{reasons}", persist=True)
+        if finished and not self._going_back and not self.destroyed and played_ok:
+            if self._stopping:
+                self.queue.history.append(finished)
+            else:
+                self.queue.finished(finished, self.loop, skipped=self._skipped)
+        self._stopping = False
+
+    async def _play_attempt(self, track: Track, *, use_local: bool, position: float) -> _Attempt:
+        """Play until the song ends, restarting FFmpeg for seeks / filter changes."""
+        voice_retries = 0
+        while not self.destroyed:
+            vc = await self._wait_for_voice()
+            if vc is None:
+                raise VoiceLost()
+            stderr = StderrBuffer()
             try:
                 source = build_source(
                     track,
@@ -330,17 +501,19 @@ class GuildPlayer:
                     position=position,
                     audio_filter=self.filter,
                     volume=self.volume,
+                    stderr=stderr,
+                    use_local=use_local,
                 )
             except Exception as exc:
                 log.exception("Could not start FFmpeg")
-                await self.send_notice(f"⚠️ Couldn't start audio for **{discord.utils.escape_markdown(track.title)}**: {exc}")
-                break
+                return _Attempt(False, f"couldn't start FFmpeg: {exc}", position)
 
             self._track_done.clear()
             self._restart_at = None
             self._skipped = False
             self._going_back = False
             self._stopping = False
+            self._play_error = None
             self._offset = position
             self._speed = self.filter.speed
             self._paused_at = None
@@ -349,46 +522,48 @@ class GuildPlayer:
             try:
                 vc.play(source, after=self._after, bitrate=max(64, min(512, channel_kbps)), signal_type="music")
             except discord.ClientException as exc:
-                log.warning("Could not start playback: %s", exc)
                 source.cleanup()
-                break
+                voice_retries += 1
+                if voice_retries <= 3 and not vc.is_connected():
+                    continue  # voice is reconnecting, wait and try again
+                return _Attempt(False, f"Discord voice wouldn't start playing: {exc}", position, voice_problem=True)
 
-            if first:
+            if self._panel_for is not track:
+                self._panel_for = track
                 await self.panel.send_new()
-                first = False
             else:
                 await self.panel.refresh()
 
             await self._track_done.wait()
 
-            if self.destroyed:
-                break
+            if self.destroyed or self._skipped or self._going_back or self._stopping:
+                return _Attempt(True)
             if self._restart_at is not None:  # seek / filter change
                 position = self._restart_at
                 continue
 
-            # FFmpeg died right away: the stream link probably expired, try once more.
+            ended_at = self.position
             played_for = time.monotonic() - self._started
-            if played_for < 2 and not self._skipped and not self._going_back and not retried:
-                retried = True
-                track.resolved_at = 0
-                try:
-                    await self.extractor.resolve(track)
-                    continue
-                except ExtractionError as exc:
-                    await self.send_notice(f"⚠️ Couldn't play **{discord.utils.escape_markdown(track.title)}** - {exc}")
-                    break
-            break
+            error = self._play_error
+            details = _tail(stderr.text())
 
-        finished = self.current
-        self.current = None
-        self._paused_at = None
-        if finished and not self._going_back and not self.destroyed:
-            if self._stopping:
-                self.queue.history.append(finished)
-            else:
-                self.queue.finished(finished, self.loop, skipped=self._skipped)
-        self._stopping = False
+            if error is not None and not isinstance(error, discord.FFmpegProcessError):
+                if played_for < EARLY_FAIL_SECONDS:
+                    return _Attempt(
+                        False, f"sending audio to Discord failed ({type(error).__name__}: {error})",
+                        position, voice_problem=True,
+                    )
+                log.warning("Playback of %s stopped with an error: %r", track.title, error)
+                return _Attempt(True)
+
+            near_end = bool(track.duration and position >= track.duration - 10)
+            if played_for < EARLY_FAIL_SECONDS and not near_end and not (track.duration and track.duration <= EARLY_FAIL_SECONDS + 1):
+                return _Attempt(False, describe_ffmpeg_error(stderr.text()), position, details=details)
+
+            if track.duration and not track.is_live and ended_at < track.duration - MIDSONG_MARGIN:
+                return _Attempt(False, describe_ffmpeg_error(stderr.text()), ended_at, midsong=True, details=details)
+            return _Attempt(True)
+        return _Attempt(True)
 
     async def _tick(self) -> None:
         """Keep the progress bar moving."""
@@ -401,10 +576,10 @@ class GuildPlayer:
                     log.debug("Panel refresh failed", exc_info=True)
 
     # ------------------------------------------------------------- helpers
-    async def send_notice(self, text: str) -> None:
+    async def send_notice(self, text: str, *, persist: bool = False) -> None:
         try:
-            embed = discord.Embed(description=text, color=self.config.embed_color)
-            await self.text_channel.send(embed=embed, delete_after=30)
+            embed = discord.Embed(description=text[:4000], color=self.config.embed_color)
+            await self.text_channel.send(embed=embed, delete_after=None if persist else 30)
         except discord.HTTPException:
             pass
 
@@ -415,7 +590,7 @@ class GuildPlayer:
         self.cog.players.pop(self.guild.id, None)
 
         current = asyncio.current_task()
-        for task in (self._ticker, self._alone_task, self._task):
+        for task in (self._ticker, self._alone_task, self._task, *self._downloads.values()):
             if task and task is not current and not task.done():
                 task.cancel()
 

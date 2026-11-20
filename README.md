@@ -154,6 +154,7 @@ Only people in the bot's voice channel can use the buttons. The panel always mov
 | `DEFAULT_VOLUME` | `80` | Starting volume (0-200) |
 | `LEAVE_WHEN_DONE` | `true` | Leave the voice channel as soon as the queue is finished (`/stay` overrides it) |
 | `IDLE_TIMEOUT` | `300` | Seconds before leaving when everyone left (or when idle, if `LEAVE_WHEN_DONE=false`) |
+| `AUDIO_MODE` | `auto` | `auto`: stream, and switch to downloading if streaming fails • `stream`: never download • `download`: always download first (most reliable, a few seconds slower to start) |
 | `MAX_QUEUE_SIZE` | `500` | Maximum songs in the queue |
 | `EMBED_COLOR` | `#8B5CF6` | Color of the bot's messages |
 | `COOKIES_FILE` | *(empty)* | YouTube cookies file (see below) |
@@ -175,6 +176,12 @@ This rarely happens on a home internet connection, but if it does, give the bot 
 - **Or:** install a "Get cookies.txt LOCALLY" browser extension, open youtube.com while logged in, export the cookies as `cookies.txt` into the bot folder and set `COOKIES_FILE=cookies.txt`.
 
 Using a spare Google account for this is a good idea. Never share your cookies file.
+
+**The bot joins, doesn't play anything and leaves (or skips songs).**
+The bot now posts a **"⚠️ Couldn't play …"** message that stays in the chat and lists why each try failed. The black console window shows the full details, with links removed because YouTube links contain your IP address.
+- On its own, the bot first streams the song. If that fails, it gets a fresh link, and then it **downloads the song** and plays the file. After a download works, it downloads songs from that site right away for the rest of the session.
+- To always download, set `AUDIO_MODE=download` in `.env` (or as a Replit Secret).
+- If the message says *"YouTube is asking the bot to sign in"*, see the cookies tip below.
 
 **The bot joins but there's no sound.**
 Run **`/diagnose`** while a song is playing. It checks every step of the audio chain and tells you exactly what's wrong.

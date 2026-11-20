@@ -9,7 +9,10 @@ import os
 import re
 import shlex
 import shutil
+import tempfile
+import threading
 import time
+from pathlib import Path
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -114,6 +117,7 @@ class Track:
     requester_name: str = "Unknown"
 
     stream_url: str | None = field(default=None, repr=False)
+    local_file: str | None = field(default=None, repr=False)  # set when downloaded instead of streamed
     http_headers: dict[str, str] = field(default_factory=dict, repr=False)
     protocol: str | None = field(default=None, repr=False)
     resolved_at: float = field(default=0.0, repr=False)
@@ -125,6 +129,10 @@ class Track:
     @property
     def is_hls(self) -> bool:
         return bool(self.protocol and "m3u8" in self.protocol)
+
+    @property
+    def has_local_file(self) -> bool:
+        return bool(self.local_file and os.path.exists(self.local_file))
 
     @property
     def needs_resolve(self) -> bool:
@@ -471,6 +479,48 @@ class Extractor:
                 track.duration = None
         return track
 
+    def _download(self, url: str, folder: Path) -> str:
+        opts = self._options(
+            skip_download=False,
+            extract_flat=False,
+            outtmpl=str(folder / "%(extractor_key)s-%(id)s.%(ext)s"),
+            nopart=True,
+            overwrites=True,
+            retries=3,
+            fragment_retries=3,
+            noprogress=True,
+        )
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info and info.get("entries"):
+                info = next((e for e in info["entries"] if e), None)
+            if not info:
+                raise ExtractionError("Download returned nothing.")
+            for item in info.get("requested_downloads") or []:
+                path = item.get("filepath")
+                if path and os.path.exists(path):
+                    return path
+            path = ydl.prepare_filename(info)
+            if os.path.exists(path):
+                return path
+        raise ExtractionError("The download finished but the file is missing.")
+
+    async def download(self, track: Track, cache: AudioCache) -> Track:
+        """Let yt-dlp download the audio (more reliable than streaming on some networks)."""
+        if track.has_local_file:
+            return track
+        if track.is_live:
+            raise ExtractionError("Live streams can't be downloaded.")
+        if track.duration and track.duration > MAX_DOWNLOAD_SECONDS:
+            raise ExtractionError("This video is too long to download (over 3 hours).")
+        cache.trim()
+        try:
+            path = await asyncio.to_thread(self._download, track.url, cache.folder)
+        except yt_dlp.utils.YoutubeDLError as exc:
+            raise _friendly_error(exc) from None
+        track.local_file = path
+        return track
+
     async def related(self, track: Track, exclude: set[str]) -> Track | None:
         """Pick a song to play next for autoplay, using YouTube's own 'Mix' playlist."""
         video_id = track.video_id
@@ -499,6 +549,88 @@ class Extractor:
 # --------------------------------------------------------------------------- #
 
 
+MAX_DOWNLOAD_SECONDS = 3 * 60 * 60
+
+
+class AudioCache:
+    """Folder for downloaded songs. Emptied on start, keeps only the newest files."""
+
+    def __init__(self, max_files: int = 12) -> None:
+        self.folder = Path(tempfile.gettempdir()) / "soap-music-bot-cache"
+        self.max_files = max_files
+        shutil.rmtree(self.folder, ignore_errors=True)
+        self.folder.mkdir(parents=True, exist_ok=True)
+
+    def trim(self) -> None:
+        try:
+            files = sorted(self.folder.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return
+        for old in files[self.max_files :]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+
+class StderrBuffer:
+    """Collects the last few KB of FFmpeg's error output so we can show *why* it failed."""
+
+    LIMIT = 8192
+
+    def __init__(self) -> None:
+        self._data = bytearray()
+        self._lock = threading.Lock()
+
+    def write(self, data: bytes) -> int:
+        if not data:
+            time.sleep(0.05)  # discord.py keeps calling us after FFmpeg exits; don't spin the CPU
+            return 0
+        with self._lock:
+            self._data += data
+            del self._data[: -self.LIMIT]
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def text(self) -> str:
+        with self._lock:
+            return self._data.decode(errors="replace")
+
+
+_LINK_RE = re.compile(r"(?:https?|file)://\S+|[A-Za-z]:\\\S+|/\S*/\S+")
+
+
+def redact_links(text: str) -> str:
+    """Remove stream links / file paths (YouTube links contain your IP address)."""
+    return _LINK_RE.sub("<link>", text)
+
+
+def describe_ffmpeg_error(stderr: str) -> str:
+    """Turn FFmpeg's error output into a short, human explanation (links removed)."""
+    stderr = redact_links(stderr)
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    low = stderr.lower()
+    if "403" in low and "forbidden" in low:
+        hint = "the site refused the audio stream (HTTP 403)"
+    elif "404" in low and "not found" in low:
+        hint = "the audio stream link wasn't found (HTTP 404)"
+    elif "timed out" in low or "connection refused" in low or "network is unreachable" in low:
+        hint = "a network problem while fetching the audio"
+    elif "invalid data found" in low:
+        hint = "FFmpeg couldn't read that audio format"
+    elif "option" in low and "not found" in low:
+        hint = "this FFmpeg version doesn't support an option the bot uses"
+    elif not lines:
+        return "the audio stream ended right away without an error message"
+    else:
+        hint = "FFmpeg couldn't play the audio"
+        detail = " | ".join(lines[-2:])[:200]
+        return f"{hint} (FFmpeg says: {detail})"
+    return hint
+
+
 def build_source(
     track: Track,
     *,
@@ -506,17 +638,22 @@ def build_source(
     position: float = 0.0,
     audio_filter: AudioFilter = FILTERS["none"],
     volume: float = 1.0,
+    stderr: StderrBuffer | None = None,
+    use_local: bool = True,
 ) -> discord.PCMVolumeTransformer:
-    """Create the FFmpeg -> PCM -> volume pipeline for a resolved track."""
-    if not track.stream_url:
+    """Create the FFmpeg -> PCM -> volume pipeline for a resolved or downloaded track."""
+    local = track.local_file if use_local and track.has_local_file else None
+    if not local and not track.stream_url:
         raise ExtractionError("Track was not resolved before playing.")
+    source_path = local or track.stream_url
+    assert source_path is not None
 
     before = ["-nostdin"]
-    if track.stream_url.startswith(("http://", "https://")):
+    if not local and source_path.startswith(("http://", "https://")):
         # Recover from network hiccups instead of ending the song early.
         before += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
     user_agent = track.http_headers.get("User-Agent")
-    if user_agent:
+    if user_agent and not local:
         before += ["-user_agent", user_agent]
     options = ["-vn", "-sn", "-dn"]
 
@@ -524,7 +661,7 @@ def build_source(
     if position >= 1 and not track.is_live:
         # Seeking before -i is instant for normal files but fails on HLS (SoundCloud),
         # where seeking after -i works reliably.
-        if track.is_hls:
+        if track.is_hls and not local:
             options += ["-ss", f"{position:.2f}"]
         else:
             before += ["-ss", f"{position:.2f}"]
@@ -533,9 +670,10 @@ def build_source(
         options += ["-af", audio_filter.ffmpeg]
 
     source = discord.FFmpegPCMAudio(
-        track.stream_url,
+        source_path,
         executable=ffmpeg,
         before_options=shlex.join(before),
         options=shlex.join(options),
+        stderr=stderr,  # type: ignore[arg-type]  # any object with write() works
     )
     return discord.PCMVolumeTransformer(source, volume=volume)
