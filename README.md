@@ -8,6 +8,7 @@ A music bot you run on your own PC. Paste a YouTube link, a playlist, or just ty
 - **Live Now Playing panel**: 🔴 progress bar · ⏮️ ⏯️ ⏭️ ⏹️ 🔁 · 🔉 🔊 🔀 📜 ♾️ · 🎛️ filter menu.
 - **Audio filters**: Bass Boost, Nightcore, Vaporwave, Slowed + Reverb, 8D, Karaoke, Treble, Lo-Fi.
 - **Autoplay**: when the queue runs out, it keeps going with similar songs.
+- **Fast starts:** each song is looked up once, while the bot joins your channel. The next song is downloaded in the background, so it starts the instant the current one ends.
 - Leaves the voice channel when the queue is finished. It also pauses by itself when everyone leaves, resumes when someone comes back, and leaves after a while. **24/7 mode** keeps it in the channel.
 - Works on **Windows, macOS and Linux**. FFmpeg comes bundled, so there's nothing extra to install by hand.
 
@@ -154,7 +155,7 @@ Only people in the bot's voice channel can use the buttons. The panel always mov
 | `DEFAULT_VOLUME` | `80` | Starting volume (0-200) |
 | `LEAVE_WHEN_DONE` | `true` | Leave the voice channel as soon as the queue is finished (`/stay` overrides it) |
 | `IDLE_TIMEOUT` | `300` | Seconds before leaving when everyone left (or when idle, if `LEAVE_WHEN_DONE=false`) |
-| `AUDIO_MODE` | `auto` | `auto`: stream, and switch to downloading if streaming fails • `stream`: never download • `download`: always download first (most reliable, a few seconds slower to start) |
+| `AUDIO_MODE` | `auto` | `auto`: stream the audio the same way yt-dlp downloads it (starts in about a second) and fall back to a full download if that fails • `stream`: let FFmpeg open the link directly (old behaviour) • `download`: always download the whole song first |
 | `MAX_QUEUE_SIZE` | `500` | Maximum songs in the queue |
 | `EMBED_COLOR` | `#8B5CF6` | Color of the bot's messages |
 | `COOKIES_FILE` | *(empty)* | YouTube cookies file (see below) |
@@ -179,7 +180,7 @@ Using a spare Google account for this is a good idea. Never share your cookies f
 
 **The bot joins, doesn't play anything and leaves (or skips songs).**
 The bot now posts a **"⚠️ Couldn't play …"** message that stays in the chat and lists why each try failed. The black console window shows the full details, with links removed because YouTube links contain your IP address.
-- On its own, the bot first streams the song. If that fails, it gets a fresh link, and then it **downloads the song** and plays the file. After a download works, it downloads songs from that site right away for the rest of the session.
+- On its own, the bot streams the song the same way yt-dlp downloads it, which YouTube accepts even where it refuses FFmpeg's direct requests. If that fails too, it **downloads the whole song** and plays the file. When a download works, it remembers to download songs from that site first, even after a restart; delete `.bot-state.json` to make it forget.
 - To always download, set `AUDIO_MODE=download` in `.env` (or as a Replit Secret).
 - If the message says *"YouTube is asking the bot to sign in"*, see the cookies tip below.
 

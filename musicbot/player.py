@@ -34,7 +34,12 @@ LAST_ACTION_SHOW_SECONDS = 45
 EARLY_FAIL_SECONDS = 3.0  # a song that stops sooner than this didn't really play
 MIDSONG_MARGIN = 15  # stopping more than this many seconds before the end = the stream cut out
 
-_LABELS = {"stream": "Streaming", "stream-fresh": "Streaming (fresh link)", "download": "Downloading"}
+_LABELS = {
+    "pipe": "Streaming",
+    "stream": "Streaming (FFmpeg)",
+    "download": "Downloading",
+    "file": "Downloaded file",
+}
 
 
 class VoiceLost(Exception):
@@ -97,6 +102,8 @@ class GuildPlayer:
         self._last_track_failed = False
         self._panel_for: Track | None = None
         self._downloads: dict[int, asyncio.Task] = {}
+        self._lookups: dict[int, asyncio.Task] = {}
+        self._bg_tasks: set[asyncio.Task] = set()
         self.destroyed = False
 
         self.panel = NowPlayingPanel(self)
@@ -156,6 +163,8 @@ class GuildPlayer:
         if added:
             self._no_autoplay = False
             self._wake.set()
+            if self.current:
+                self._preload_next()  # get it ready now if it's up next
         return added
 
     # -------------------------------------------------------------- controls
@@ -360,33 +369,69 @@ class GuildPlayer:
         return None
 
     def _plan(self, track: Track) -> list[str]:
-        """Which ways to get the audio, in order."""
+        """How to get the audio, in order of preference (decided after the lookup)."""
+        if track.has_local_file:
+            return ["file"]
         mode = self.config.audio_mode
-        if track.is_live:
-            return ["stream", "stream-fresh"]
+        if not track.can_pipe:  # HLS (SoundCloud), live streams, ...
+            if track.is_live:
+                return ["stream"]
+            if mode == "download":
+                return ["download", "stream"]
+            return ["stream"] if mode == "stream" else ["stream", "download"]
         if mode == "stream":
-            return ["stream", "stream-fresh"]
+            return ["stream"]
         if mode == "download" or track.source in self.cog.download_sources:
-            return ["download", "stream"]
-        return ["stream", "stream-fresh", "download"]
+            return ["download", "pipe"]
+        return ["pipe", "download"]
 
-    async def _download(self, track: Track) -> None:
-        task = self._downloads.get(id(track))
-        if task is None or (task.done() and not track.has_local_file):
-            task = asyncio.create_task(self.extractor.download(track, self.cog.cache))
-            self._downloads[id(track)] = task
+    async def _once(self, tasks: dict[int, asyncio.Task], track: Track, factory) -> None:
+        """Run factory() for this track, sharing the work if it's already running (e.g. preload)."""
+        task = tasks.get(id(track))
+        if task is None or task.done():
+            task = asyncio.create_task(factory())
+            tasks[id(track)] = task
         try:
             await asyncio.shield(task)
         finally:
-            if task.done():
-                self._downloads.pop(id(track), None)
+            if task.done() and tasks.get(id(track)) is task:
+                tasks.pop(id(track), None)
 
-    async def _prefetch(self, track: Track) -> None:
+    async def _resolve(self, track: Track) -> None:
+        await self._once(self._lookups, track, lambda: self.extractor.resolve(track))
+
+    async def _download(self, track: Track) -> None:
+        await self._once(self._downloads, track, lambda: self.extractor.download(track, self.cog.cache))
+
+    async def _preload(self, track: Track) -> None:
+        """Get the next song ready while this one plays, so it starts instantly."""
         try:
-            await self._download(track)
-            log.info("Pre-downloaded the next song: %s", track.title)
+            if not track.has_local_file and track.needs_resolve:
+                await self._resolve(track)
+            first = self._plan(track)[0]
+            if first == "download":
+                await self._download(track)
+            elif first == "pipe":
+                await self._once(self._downloads, track,
+                                 lambda: self.extractor.predownload(track, self.cog.cache))
+            log.info("Next song is ready: %s", track.title)
         except Exception as exc:
-            log.debug("Pre-download failed for %s: %s", track.title, exc)
+            log.debug("Preloading %s failed: %s", track.title, exc)
+
+    def _preload_next(self) -> None:
+        if not self.queue:
+            return
+        nxt = self.queue[0]
+        if nxt.is_live or id(nxt) in self._lookups or id(nxt) in self._downloads:
+            return
+        if nxt.has_local_file:
+            return
+        self._background(self._preload(nxt))
+
+    def _background(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def _play(self, track: Track) -> None:
         if await self._wait_for_voice() is None:
@@ -397,52 +442,50 @@ class GuildPlayer:
         self._panel_for = None
         self.last_played = track
         failures: list[str] = []
-        plan = self._plan(track)
+        played_ok = False
+
+        # 1) Look the song up (once). Already done by /play for single songs.
+        if not track.has_local_file and track.needs_resolve:
+            try:
+                await self._resolve(track)
+            except ExtractionError as exc:
+                failures.append(f"Looking up the song: {exc}")
+                log.warning("Couldn't look up %s: %s", track.title, exc)
+
+        # If the song is still being pre-downloaded, wait for that rather than start over.
+        pending = self._downloads.get(id(track))
+        if pending is not None and not pending.done() and not failures:
+            try:
+                await asyncio.wait_for(asyncio.shield(pending), 8)
+            except Exception:
+                pass
+
+        # 2) Play it, trying the next way to get the audio if one fails.
+        plan = [] if failures else self._plan(track)
         position = 0.0
         resumed = False
         index = 0
-        played_ok = False
-
         while index < len(plan) and not self.destroyed:
             how = plan[index]
-            use_local = how == "download"
             if failures or resumed:
-                # Freeze the progress bar while we fetch the audio another way.
-                self._paused_at = time.monotonic()
-                if use_local:
+                self._paused_at = time.monotonic()  # freeze the progress bar meanwhile
+                if how == "download":
                     self.note("⏬ Streaming didn't work, downloading the song instead…")
-                    asyncio.create_task(self.panel.refresh())
-            try:
-                if use_local:
+                    self._background(self.panel.refresh())
+            if how == "download":
+                try:
                     await self._download(track)
-                else:
-                    if how == "stream-fresh":
-                        track.resolved_at = 0
-                    await self.extractor.resolve(track)
-            except ExtractionError as exc:
-                failures.append(f"{_LABELS[how]}: {exc}")
-                log.warning("%s failed for %s: %s", _LABELS[how], track.title, exc)
-                if not use_local:
-                    break  # yt-dlp couldn't even look the song up; other ways would fail the same way
-                index += 1
-                continue
+                except ExtractionError as exc:
+                    failures.append(f"{_LABELS[how]}: {exc}")
+                    log.warning("%s failed for %s: %s", _LABELS[how], track.title, exc)
+                    index += 1
+                    continue
+                if failures and self.config.audio_mode == "auto":
+                    self.cog.remember_download(track.source)
 
             self.current = track
-            self.last_played = track
-            log.info("Playing %s (%s)", track.title, "downloaded file" if use_local else "streaming")
-            if use_local and failures and self.config.audio_mode == "auto" and track.source not in self.cog.download_sources:
-                self.cog.download_sources.add(track.source)
-                log.warning(
-                    "Streaming from %s doesn't work on this connection, so the bot will download "
-                    "%s songs before playing them for the rest of this session.",
-                    track.source, track.source,
-                )
-            if use_local and self.queue and not track.is_live:
-                nxt = self.queue[0]
-                if not nxt.is_live and not nxt.has_local_file and id(nxt) not in self._downloads:
-                    asyncio.create_task(self._prefetch(nxt))
-
-            result = await self._play_attempt(track, use_local=use_local, position=position)
+            log.info("Playing %s (%s)", track.title, _LABELS[how].lower())
+            result = await self._play_attempt(track, how=how, position=position)
             if result.ok:
                 played_ok = True
                 break
@@ -455,10 +498,7 @@ class GuildPlayer:
                 resumed = True
                 position = result.position
                 log.warning("%s cut out at %s (%s), resuming.", track.title, format_duration(position), result.reason)
-                if not use_local:
-                    track.resolved_at = 0
                 continue
-
             if resumed:
                 log.warning("%s couldn't be resumed (%s), moving on.", track.title, result.reason)
                 played_ok = True
@@ -467,7 +507,7 @@ class GuildPlayer:
             log.warning("%s failed for %s: %s%s", _LABELS[how], track.title, result.reason,
                         f"\n    FFmpeg output:\n{result.details}" if result.details else "")
             if result.voice_problem:
-                break  # another audio source won't help
+                break  # another way of getting the audio won't help
             position = result.position
             index += 1
 
@@ -486,7 +526,7 @@ class GuildPlayer:
                 self.queue.finished(finished, self.loop, skipped=self._skipped)
         self._stopping = False
 
-    async def _play_attempt(self, track: Track, *, use_local: bool, position: float) -> _Attempt:
+    async def _play_attempt(self, track: Track, *, how: str, position: float) -> _Attempt:
         """Play until the song ends, restarting FFmpeg for seeks / filter changes."""
         voice_retries = 0
         while not self.destroyed:
@@ -494,7 +534,12 @@ class GuildPlayer:
             if vc is None:
                 raise VoiceLost()
             stderr = StderrBuffer()
+            pipe = None
+            # A finished pipe leaves a copy on disk: seeks/replays then use that (instant).
+            use_local = how in ("file", "download") or (how == "pipe" and track.has_local_file)
             try:
+                if how == "pipe" and not use_local:
+                    pipe = self.extractor.open_pipe(track, self.cog.cache)
                 source = build_source(
                     track,
                     ffmpeg=self.cog.ffmpeg,
@@ -503,8 +548,11 @@ class GuildPlayer:
                     volume=self.volume,
                     stderr=stderr,
                     use_local=use_local,
+                    pipe=pipe,
                 )
             except Exception as exc:
+                if pipe:
+                    pipe.close()
                 log.exception("Could not start FFmpeg")
                 return _Attempt(False, f"couldn't start FFmpeg: {exc}", position)
 
@@ -523,6 +571,8 @@ class GuildPlayer:
                 vc.play(source, after=self._after, bitrate=max(64, min(512, channel_kbps)), signal_type="music")
             except discord.ClientException as exc:
                 source.cleanup()
+                if pipe:
+                    pipe.close()
                 voice_retries += 1
                 if voice_retries <= 3 and not vc.is_connected():
                     continue  # voice is reconnecting, wait and try again
@@ -531,10 +581,18 @@ class GuildPlayer:
             if self._panel_for is not track:
                 self._panel_for = track
                 await self.panel.send_new()
+                self._preload_next()
             else:
                 await self.panel.refresh()
 
             await self._track_done.wait()
+
+            pipe_error = None
+            if pipe is not None:
+                pipe.close()
+                pipe_error = pipe.error
+                if pipe.saved_file:
+                    track.local_file = pipe.saved_file
 
             if self.destroyed or self._skipped or self._going_back or self._stopping:
                 return _Attempt(True)
@@ -546,6 +604,7 @@ class GuildPlayer:
             played_for = time.monotonic() - self._started
             error = self._play_error
             details = _tail(stderr.text())
+            reason = pipe_error or describe_ffmpeg_error(stderr.text())
 
             if error is not None and not isinstance(error, discord.FFmpegProcessError):
                 if played_for < EARLY_FAIL_SECONDS:
@@ -558,10 +617,10 @@ class GuildPlayer:
 
             near_end = bool(track.duration and position >= track.duration - 10)
             if played_for < EARLY_FAIL_SECONDS and not near_end and not (track.duration and track.duration <= EARLY_FAIL_SECONDS + 1):
-                return _Attempt(False, describe_ffmpeg_error(stderr.text()), position, details=details)
+                return _Attempt(False, reason, position, details=details)
 
             if track.duration and not track.is_live and ended_at < track.duration - MIDSONG_MARGIN:
-                return _Attempt(False, describe_ffmpeg_error(stderr.text()), ended_at, midsong=True, details=details)
+                return _Attempt(False, reason, ended_at, midsong=True, details=details)
             return _Attempt(True)
         return _Attempt(True)
 
@@ -590,7 +649,8 @@ class GuildPlayer:
         self.cog.players.pop(self.guild.id, None)
 
         current = asyncio.current_task()
-        for task in (self._ticker, self._alone_task, self._task, *self._downloads.values()):
+        for task in (self._ticker, self._alone_task, self._task, *self._downloads.values(),
+                     *self._lookups.values(), *self._bg_tasks):
             if task and task is not current and not task.done():
                 task.cancel()
 

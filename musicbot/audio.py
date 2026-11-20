@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import glob
+import random
 import logging
 import os
 import re
@@ -119,6 +121,9 @@ class Track:
     stream_url: str | None = field(default=None, repr=False)
     local_file: str | None = field(default=None, repr=False)  # set when downloaded instead of streamed
     http_headers: dict[str, str] = field(default_factory=dict, repr=False)
+    info: dict[str, Any] | None = field(default=None, repr=False, compare=False)  # full yt-dlp result
+    filesize: int | None = field(default=None, repr=False)
+    chunk_size: int | None = field(default=None, repr=False)
     protocol: str | None = field(default=None, repr=False)
     resolved_at: float = field(default=0.0, repr=False)
 
@@ -129,6 +134,16 @@ class Track:
     @property
     def is_hls(self) -> bool:
         return bool(self.protocol and "m3u8" in self.protocol)
+
+    @property
+    def can_pipe(self) -> bool:
+        """Plain web file (not HLS/DASH/live): we can fetch it ourselves and pipe it into FFmpeg."""
+        return bool(
+            self.stream_url
+            and self.stream_url.startswith(("http://", "https://"))
+            and self.protocol in ("http", "https")
+            and not self.is_live
+        )
 
     @property
     def has_local_file(self) -> bool:
@@ -382,6 +397,9 @@ def _apply_stream(track: Track, info: dict[str, Any]) -> None:
     track.stream_url = info["url"]
     track.http_headers = dict(info.get("http_headers") or {})
     track.protocol = info.get("protocol")
+    track.filesize = info.get("filesize")  # exact size only: an estimate could cut the song short
+    track.chunk_size = (info.get("downloader_options") or {}).get("http_chunk_size")
+    track.info = info
     track.resolved_at = time.time()
 
 
@@ -444,7 +462,8 @@ class Extractor:
         if is_url(query):
             info = await self._run(query, playlistend=limit)
         else:
-            info = await self._run(f"ytsearch1:{query}")
+            # Search and look up the audio in one go (saves a whole round trip).
+            info = await self._run(f"ytsearch1:{query}", extract_flat=False)
         if not info:
             return [], None
 
@@ -479,7 +498,7 @@ class Extractor:
                 track.duration = None
         return track
 
-    def _download(self, url: str, folder: Path) -> str:
+    def _download(self, url: str, folder: Path, info: dict[str, Any] | None = None) -> str:
         opts = self._options(
             skip_download=False,
             extract_flat=False,
@@ -491,7 +510,11 @@ class Extractor:
             noprogress=True,
         )
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            if info is not None:
+                # Reuse the lookup we already did instead of asking YouTube again.
+                info = ydl.process_ie_result(copy.deepcopy(info), download=True)
+            else:
+                info = ydl.extract_info(url, download=True)
             if info and info.get("entries"):
                 info = next((e for e in info["entries"] if e), None)
             if not info:
@@ -514,11 +537,42 @@ class Extractor:
         if track.duration and track.duration > MAX_DOWNLOAD_SECONDS:
             raise ExtractionError("This video is too long to download (over 3 hours).")
         cache.trim()
+        info = track.info if track.info is not None and not track.needs_resolve else None
         try:
-            path = await asyncio.to_thread(self._download, track.url, cache.folder)
+            path = await asyncio.to_thread(self._download, track.url, cache.folder, info)
         except yt_dlp.utils.YoutubeDLError as exc:
             raise _friendly_error(exc) from None
         track.local_file = path
+        return track
+
+    def open_pipe(self, track: Track, cache: AudioCache) -> PipeReader:
+        """Fetch the audio the same way yt-dlp downloads it, for FFmpeg to read as it arrives."""
+        assert track.stream_url
+        cache.trim()
+        key = re.sub(r"[^A-Za-z0-9_-]", "_", track.video_id or str(abs(hash(track.url))))
+        ext = (track.info or {}).get("ext") or "audio"
+        return PipeReader(
+            make_ydl=lambda: yt_dlp.YoutubeDL(self._options()),
+            url=track.stream_url,
+            headers=track.http_headers,
+            chunk_size=track.chunk_size or PIPE_CHUNK_SIZE,
+            filesize=track.filesize,
+            save_to=cache.folder / f"{key}.{ext}",
+            # From now on seeks, replays and loops use the file (instant, no network).
+            on_complete=lambda path: setattr(track, "local_file", path),
+        )
+
+    async def predownload(self, track: Track, cache: AudioCache) -> Track:
+        """Download the next song the fast, yt-dlp-style way so it starts instantly."""
+        if track.has_local_file:
+            return track
+        pipe = self.open_pipe(track, cache)
+        pipe.start()
+        assert pipe._thread is not None
+        await asyncio.to_thread(pipe._thread.join)
+        pipe.close()
+        if pipe.error or not track.has_local_file:
+            raise ExtractionError(pipe.error or "pre-download didn't finish")
         return track
 
     async def related(self, track: Track, exclude: set[str]) -> Track | None:
@@ -550,6 +604,178 @@ class Extractor:
 
 
 MAX_DOWNLOAD_SECONDS = 3 * 60 * 60
+PIPE_CHUNK_SIZE = 10 << 20  # same 10 MB pieces yt-dlp uses for YouTube
+
+
+class PipeReader:
+    """File-like object that downloads audio with yt-dlp's own HTTP code while FFmpeg plays it.
+
+    Some networks get "403 Forbidden" when FFmpeg opens a YouTube link directly, while yt-dlp's
+    way of asking (byte ranges + its headers/cookies) works. A background thread downloads the
+    song at full speed into the cache folder; read() hands FFmpeg whatever has arrived, so music
+    starts as soon as the first bytes are in. Once complete, the file is reused for seeks/replays.
+    read() never raises: errors are stored in .error and the stream just ends.
+    """
+
+    RETRIES = 3
+    BLOCK = 64 * 1024
+
+    def __init__(self, *, make_ydl, url: str, headers: dict[str, str], chunk_size: int,
+                 filesize: int | None, save_to: Path | None, on_complete=None) -> None:
+        self._make_ydl = make_ydl
+        self._on_complete = on_complete
+        self.url = url
+        self.headers = {"Accept-Encoding": "identity", **headers}
+        self.chunk_size = chunk_size
+        self.filesize = filesize
+        self.path = save_to or Path(tempfile.gettempdir()) / f"soap-pipe-{id(self)}.audio"
+        self.keep = save_to is not None
+        self.error: str | None = None
+        self.complete = False
+        self.saved_file: str | None = None
+        self._written = 0
+        self._read_pos = 0
+        self._finished = False
+        self._closed = False
+        self._cond = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._reader = None
+
+    # -- background download -----------------------------------------------------
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._download, name="soap-pipe", daemon=True)
+            self._thread.start()
+
+    def _download(self) -> None:
+        from yt_dlp.networking import Request
+
+        ydl = None
+        out = None
+        try:
+            out = open(self.path, "wb")
+            ydl = self._make_ydl()
+            tries = 0
+            while not self._closed and not (self.filesize is not None and self._written >= self.filesize):
+                size = random.randint(int(self.chunk_size * 0.95), self.chunk_size)
+                end = self._written + size - 1
+                if self.filesize:
+                    end = min(end, self.filesize - 1)
+                try:
+                    resp = ydl.urlopen(Request(self.url, headers=dict(self.headers, Range=f"bytes={self._written}-{end}")))
+                    try:
+                        if resp.status == 200 and self._written > 0:
+                            raise OSError("the server doesn't support resuming")
+                        total = (resp.headers.get("Content-Range") or "").rsplit("/", 1)[-1]
+                        if total.isdigit():
+                            self.filesize = int(total)
+                        elif resp.status == 200:
+                            length = resp.headers.get("Content-Length") or ""
+                            self.filesize = int(length) if length.isdigit() else None
+                        got = 0
+                        while not self._closed:
+                            data = resp.read(self.BLOCK)
+                            if not data:
+                                break
+                            out.write(data)
+                            out.flush()
+                            got += len(data)
+                            with self._cond:
+                                self._written += len(data)
+                                self._cond.notify_all()
+                    finally:
+                        resp.close()
+                    if got == 0 or self.filesize is None:
+                        break  # nothing more to fetch (or the server sent the whole file at once)
+                    tries = 0
+                except Exception as exc:
+                    tries += 1
+                    if tries > self.RETRIES or getattr(exc, "status", None) in (401, 403, 404, 410):
+                        self.error = redact_links(self._describe(exc))
+                        log.debug("Pipe download failed at byte %s: %s", self._written, exc)
+                        return
+                    time.sleep(0.5 * tries)
+            if not self._closed:
+                self.complete = True
+        except Exception as exc:  # disk full, can't create file, ...
+            self.error = redact_links(self._describe(exc))
+        finally:
+            if out is not None:
+                out.close()
+            if ydl is not None:
+                try:
+                    ydl.close()
+                except Exception:
+                    pass
+            if self.complete and self.keep:
+                self.saved_file = str(self.path)
+                if self._on_complete is not None:
+                    try:
+                        self._on_complete(self.saved_file)
+                    except Exception:
+                        log.debug("on_complete failed", exc_info=True)
+            with self._cond:
+                self._finished = True
+                self._cond.notify_all()
+
+    @staticmethod
+    def _describe(exc: Exception) -> str:
+        status = getattr(exc, "status", None)
+        if status == 403:
+            return "the site refused the audio download too (HTTP 403)"
+        if status:
+            return f"the audio download failed (HTTP {status})"
+        return f"the audio download failed ({type(exc).__name__}: {str(exc)[:120]})"
+
+    # -- file-like API for discord.py (called from its writer thread) ---------------
+    def read(self, n: int = -1) -> bytes:
+        self.start()
+        n = n if n and n > 0 else self.BLOCK
+        with self._cond:
+            while not self._closed and self._read_pos >= self._written and not self._finished:
+                self._cond.wait(1.0)
+            if self._closed or self._read_pos >= self._written:
+                self._close_reader()
+                return b""  # finished (or failed: see .error)
+            available = self._written - self._read_pos
+        try:
+            if self._reader is None:
+                self._reader = open(self.path, "rb")
+            self._reader.seek(self._read_pos)
+            data = self._reader.read(min(n, available))
+        except (OSError, ValueError) as exc:  # ValueError: closed by cleanup meanwhile
+            self.error = self.error or f"couldn't read the downloaded audio ({exc})"
+            return b""
+        self._read_pos += len(data)
+        return data
+
+    def _close_reader(self) -> None:
+        if self._reader is not None:
+            try:
+                self._reader.close()
+            except OSError:
+                pass
+            self._reader = None
+
+    def close(self) -> None:
+        """Stop. Never blocks. Half-downloaded files are removed by the cleanup thread."""
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+        threading.Thread(target=self._cleanup, name="soap-pipe-cleanup", daemon=True).start()
+
+    def _cleanup(self) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=20)
+        self._close_reader()
+        if not self.complete or not self.keep:
+            for _ in range(10):  # Windows can't delete a file that's still open; retry briefly
+                try:
+                    if self.path.exists():
+                        self.path.unlink()
+                    break
+                except OSError:
+                    time.sleep(0.3)
 
 
 class AudioCache:
@@ -640,20 +866,20 @@ def build_source(
     volume: float = 1.0,
     stderr: StderrBuffer | None = None,
     use_local: bool = True,
+    pipe: PipeReader | None = None,
 ) -> discord.PCMVolumeTransformer:
     """Create the FFmpeg -> PCM -> volume pipeline for a resolved or downloaded track."""
-    local = track.local_file if use_local and track.has_local_file else None
-    if not local and not track.stream_url:
+    local = track.local_file if use_local and track.has_local_file and pipe is None else None
+    if pipe is None and not local and not track.stream_url:
         raise ExtractionError("Track was not resolved before playing.")
-    source_path = local or track.stream_url
-    assert source_path is not None
+    source_path = local or track.stream_url or ""
 
-    before = ["-nostdin"]
-    if not local and source_path.startswith(("http://", "https://")):
+    before = [] if pipe is not None else ["-nostdin"]
+    if pipe is None and not local and source_path.startswith(("http://", "https://")):
         # Recover from network hiccups instead of ending the song early.
         before += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
     user_agent = track.http_headers.get("User-Agent")
-    if user_agent and not local:
+    if user_agent and not local and pipe is None:
         before += ["-user_agent", user_agent]
     options = ["-vn", "-sn", "-dn"]
 
@@ -661,8 +887,8 @@ def build_source(
     if position >= 1 and not track.is_live:
         # Seeking before -i is instant for normal files but fails on HLS (SoundCloud),
         # where seeking after -i works reliably.
-        if track.is_hls and not local:
-            options += ["-ss", f"{position:.2f}"]
+        if (track.is_hls and not local) or pipe is not None:
+            options += ["-ss", f"{position:.2f}"]  # can't jump ahead in a pipe/HLS, so skip forward
         else:
             before += ["-ss", f"{position:.2f}"]
 
@@ -670,8 +896,9 @@ def build_source(
         options += ["-af", audio_filter.ffmpeg]
 
     source = discord.FFmpegPCMAudio(
-        source_path,
+        pipe if pipe is not None else source_path,  # type: ignore[arg-type]
         executable=ffmpeg,
+        pipe=pipe is not None,
         before_options=shlex.join(before),
         options=shlex.join(options),
         stderr=stderr,  # type: ignore[arg-type]  # any object with write() works

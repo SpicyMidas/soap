@@ -1,5 +1,8 @@
 # secrets
 .env
+
+# what the bot learned about your connection
+.bot-state.json
 cookies.txt
 *.cookies.txt
 

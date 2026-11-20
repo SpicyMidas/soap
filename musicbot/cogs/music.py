@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import OrderedDict
 from typing import Optional
@@ -12,7 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..audio import FILTERS, AudioCache, ExtractionError, Extractor, Track, find_ffmpeg, format_duration, is_url, parse_timestamp
-from ..config import Config
+from ..config import ROOT, Config
 from ..diagnostics import build_report, install_drop_counter, log_startup_checks
 from ..musicqueue import LoopMode, QueueFull
 from ..player import GuildPlayer
@@ -32,6 +33,7 @@ from ..ui import (
 
 log = logging.getLogger("musicbot.music")
 
+STATE_FILE = ROOT / ".bot-state.json"  # remembers what works on this connection between restarts
 AUTOCOMPLETE_TIMEOUT = 2.5
 AUTOCOMPLETE_CACHE_SIZE = 256
 
@@ -48,7 +50,7 @@ class Music(commands.Cog):
         self.ffmpeg = find_ffmpeg()
         self.players: dict[int, GuildPlayer] = {}
         self.cache = AudioCache()
-        self.download_sources: set[str] = set()  # sites whose streams failed, so we download instead
+        self.download_sources: set[str] = self._load_state()  # sites that must be downloaded first
         self._voice_locks: dict[int, asyncio.Lock] = {}
         self._ac_cache: OrderedDict[str, list[Track]] = OrderedDict()
         log.info("Using FFmpeg: %s", self.ffmpeg)
@@ -56,6 +58,28 @@ class Music(commands.Cog):
         log.info("Audio mode: %s", config.audio_mode)
         install_drop_counter()
         log_startup_checks()
+
+    def _load_state(self) -> set[str]:
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            sources = {str(s) for s in data.get("download_sources", [])}
+            if sources:
+                log.info("Remembered from last time: download songs from %s before playing.", ", ".join(sorted(sources)))
+            return sources
+        except (OSError, ValueError, AttributeError):
+            return set()
+
+    def remember_download(self, source: str) -> None:
+        """Streaming from this site failed but downloading worked: do that straight away from now on."""
+        if source in self.download_sources:
+            return
+        self.download_sources.add(source)
+        log.warning("Streaming from %s doesn't work on this connection, so the bot will download %s songs "
+                    "first from now on (saved in %s; delete that file to undo).", source, source, STATE_FILE.name)
+        try:
+            STATE_FILE.write_text(json.dumps({"download_sources": sorted(self.download_sources)}), encoding="utf-8")
+        except OSError:
+            pass
 
     async def cog_unload(self) -> None:
         for player in list(self.players.values()):
@@ -138,12 +162,22 @@ class Music(commands.Cog):
             await player.panel.refresh()
 
     async def _queue_query(self, interaction: discord.Interaction, query: str, *, front: bool) -> None:
+        member = self._member(interaction)
+        if not member.voice or not member.voice.channel:
+            raise MusicError("Join a voice channel first, then try again!")
         await interaction.response.defer(thinking=True)
-        player = await self.ensure_voice(interaction)
+
+        # Look the song up while joining the voice channel (both take a moment).
+        lookup = asyncio.create_task(self.extractor.fetch(query, limit=self.config.max_queue_size))
+        try:
+            player = await self.ensure_voice(interaction)
+        except BaseException:
+            lookup.cancel()
+            raise
         was_idle = not player.current and not player.queue
 
         try:
-            tracks, playlist = await self.extractor.fetch(query, limit=max(1, player.queue.space_left))
+            tracks, playlist = await lookup
         except ExtractionError as exc:
             raise MusicError(str(exc)) from None
         if not tracks:
