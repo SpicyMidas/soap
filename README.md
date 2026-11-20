@@ -155,7 +155,7 @@ Only people in the bot's voice channel can use the buttons. The panel always mov
 | `DEFAULT_VOLUME` | `80` | Starting volume (0-200) |
 | `LEAVE_WHEN_DONE` | `true` | Leave the voice channel as soon as the queue is finished (`/stay` overrides it) |
 | `IDLE_TIMEOUT` | `300` | Seconds before leaving when everyone left (or when idle, if `LEAVE_WHEN_DONE=false`) |
-| `AUDIO_MODE` | `auto` | `auto`: stream the audio the same way yt-dlp downloads it (starts in about a second) and fall back to a full download if that fails • `stream`: let FFmpeg open the link directly (old behaviour) • `download`: always download the whole song first |
+| `AUDIO_MODE` | `auto` | `auto`: yt-dlp downloads the song while it plays (starts in about a second), with a full download as backup • `stream`: let FFmpeg open the link directly (old behaviour) • `download`: always download the whole song first |
 | `MAX_QUEUE_SIZE` | `500` | Maximum songs in the queue |
 | `EMBED_COLOR` | `#8B5CF6` | Color of the bot's messages |
 | `COOKIES_FILE` | *(empty)* | YouTube cookies file (see below) |
@@ -180,7 +180,7 @@ Using a spare Google account for this is a good idea. Never share your cookies f
 
 **The bot joins, doesn't play anything and leaves (or skips songs).**
 The bot now posts a **"⚠️ Couldn't play …"** message that stays in the chat and lists why each try failed. The black console window shows the full details, with links removed because YouTube links contain your IP address.
-- On its own, the bot streams the song the same way yt-dlp downloads it, which YouTube accepts even where it refuses FFmpeg's direct requests. If that fails too, it **downloads the whole song** and plays the file. When a download works, it remembers to download songs from that site first, even after a restart; delete `.bot-state.json` to make it forget.
+- On its own, the bot plays each song while yt-dlp downloads it, which YouTube accepts even where it refuses FFmpeg's direct requests. If that fails too, it **downloads the whole song** and plays the file. When a download works, it remembers to download songs from that site first, even after a restart; delete `.bot-state.json` to make it forget.
 - To always download, set `AUDIO_MODE=download` in `.env` (or as a Replit Secret).
 - If the message says *"YouTube is asking the bot to sign in"*, see the cookies tip below.
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import glob
-import random
 import logging
 import os
 import re
@@ -546,17 +545,34 @@ class Extractor:
         return track
 
     def open_pipe(self, track: Track, cache: AudioCache) -> PipeReader:
-        """Fetch the audio the same way yt-dlp downloads it, for FFmpeg to read as it arrives."""
-        assert track.stream_url
+        """Download with yt-dlp's own downloader while FFmpeg plays the file as it grows."""
         cache.trim()
         key = re.sub(r"[^A-Za-z0-9_-]", "_", track.video_id or str(abs(hash(track.url))))
         ext = (track.info or {}).get("ext") or "audio"
+        info = track.info if track.info is not None and not track.needs_resolve else None
+        url = track.url
+
+        def run_download(path: Path, hooks: list) -> None:
+            opts = self._options(
+                skip_download=False,
+                extract_flat=False,
+                outtmpl=str(path).replace("%", "%%"),
+                nopart=True,
+                overwrites=True,
+                updatetime=False,
+                progress_hooks=hooks,
+                retries=3,
+                fragment_retries=3,
+            )
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                if info is not None:
+                    # Reuse the lookup we already did: no extra request to YouTube.
+                    ydl.process_ie_result(copy.deepcopy(info), download=True)
+                else:
+                    ydl.extract_info(url, download=True)
+
         return PipeReader(
-            make_ydl=lambda: yt_dlp.YoutubeDL(self._options()),
-            url=track.stream_url,
-            headers=track.http_headers,
-            chunk_size=track.chunk_size or PIPE_CHUNK_SIZE,
-            filesize=track.filesize,
+            run_download=run_download,
             save_to=cache.folder / f"{key}.{ext}",
             # From now on seeks, replays and loops use the file (instant, no network).
             on_complete=lambda path: setattr(track, "local_file", path),
@@ -604,36 +620,28 @@ class Extractor:
 
 
 MAX_DOWNLOAD_SECONDS = 3 * 60 * 60
-PIPE_CHUNK_SIZE = 10 << 20  # same 10 MB pieces yt-dlp uses for YouTube
 
 
 class PipeReader:
-    """File-like object that downloads audio with yt-dlp's own HTTP code while FFmpeg plays it.
+    """File-like object: yt-dlp downloads the song into the cache while FFmpeg plays it.
 
-    Some networks get "403 Forbidden" when FFmpeg opens a YouTube link directly, while yt-dlp's
-    way of asking (byte ranges + its headers/cookies) works. A background thread downloads the
-    song at full speed into the cache folder; read() hands FFmpeg whatever has arrived, so music
-    starts as soon as the first bytes are in. Once complete, the file is reused for seeks/replays.
+    Some networks get "403 Forbidden" when anything but yt-dlp's own downloader asks YouTube
+    for the audio. So a background thread runs yt-dlp's real downloader into a file, and read()
+    hands FFmpeg whatever has been written so far: music starts with the first bytes instead of
+    after the whole download. Once complete, the file is reused for seeks/replays/loops.
     read() never raises: errors are stored in .error and the stream just ends.
     """
 
-    RETRIES = 3
     BLOCK = 64 * 1024
 
-    def __init__(self, *, make_ydl, url: str, headers: dict[str, str], chunk_size: int,
-                 filesize: int | None, save_to: Path | None, on_complete=None) -> None:
-        self._make_ydl = make_ydl
+    def __init__(self, *, run_download, save_to: Path | None, on_complete=None) -> None:
+        self._run_download = run_download
         self._on_complete = on_complete
-        self.url = url
-        self.headers = {"Accept-Encoding": "identity", **headers}
-        self.chunk_size = chunk_size
-        self.filesize = filesize
         self.path = save_to or Path(tempfile.gettempdir()) / f"soap-pipe-{id(self)}.audio"
         self.keep = save_to is not None
         self.error: str | None = None
         self.complete = False
         self.saved_file: str | None = None
-        self._written = 0
         self._read_pos = 0
         self._finished = False
         self._closed = False
@@ -647,66 +655,26 @@ class PipeReader:
             self._thread = threading.Thread(target=self._download, name="soap-pipe", daemon=True)
             self._thread.start()
 
-    def _download(self) -> None:
-        from yt_dlp.networking import Request
+    def _hook(self, status: dict) -> None:
+        if self._closed:
+            raise yt_dlp.utils.DownloadCancelled("stopped")
+        with self._cond:
+            self._cond.notify_all()  # new data on disk
 
-        ydl = None
-        out = None
+    def _download(self) -> None:
         try:
-            out = open(self.path, "wb")
-            ydl = self._make_ydl()
-            tries = 0
-            while not self._closed and not (self.filesize is not None and self._written >= self.filesize):
-                size = random.randint(int(self.chunk_size * 0.95), self.chunk_size)
-                end = self._written + size - 1
-                if self.filesize:
-                    end = min(end, self.filesize - 1)
-                try:
-                    resp = ydl.urlopen(Request(self.url, headers=dict(self.headers, Range=f"bytes={self._written}-{end}")))
-                    try:
-                        if resp.status == 200 and self._written > 0:
-                            raise OSError("the server doesn't support resuming")
-                        total = (resp.headers.get("Content-Range") or "").rsplit("/", 1)[-1]
-                        if total.isdigit():
-                            self.filesize = int(total)
-                        elif resp.status == 200:
-                            length = resp.headers.get("Content-Length") or ""
-                            self.filesize = int(length) if length.isdigit() else None
-                        got = 0
-                        while not self._closed:
-                            data = resp.read(self.BLOCK)
-                            if not data:
-                                break
-                            out.write(data)
-                            out.flush()
-                            got += len(data)
-                            with self._cond:
-                                self._written += len(data)
-                                self._cond.notify_all()
-                    finally:
-                        resp.close()
-                    if got == 0 or self.filesize is None:
-                        break  # nothing more to fetch (or the server sent the whole file at once)
-                    tries = 0
-                except Exception as exc:
-                    tries += 1
-                    if tries > self.RETRIES or getattr(exc, "status", None) in (401, 403, 404, 410):
-                        self.error = redact_links(self._describe(exc))
-                        log.debug("Pipe download failed at byte %s: %s", self._written, exc)
-                        return
-                    time.sleep(0.5 * tries)
-            if not self._closed:
+            try:
+                self.path.unlink()  # never play a stale copy
+            except OSError:
+                pass
+            self._run_download(self.path, [self._hook])
+            if not self._closed and self.path.exists():
                 self.complete = True
-        except Exception as exc:  # disk full, can't create file, ...
-            self.error = redact_links(self._describe(exc))
+        except Exception as exc:
+            if not self._closed:
+                self.error = redact_links(self._describe(exc))
+                log.debug("Download for streaming failed: %s", exc)
         finally:
-            if out is not None:
-                out.close()
-            if ydl is not None:
-                try:
-                    ydl.close()
-                except Exception:
-                    pass
             if self.complete and self.keep:
                 self.saved_file = str(self.path)
                 if self._on_complete is not None:
@@ -718,26 +686,37 @@ class PipeReader:
                 self._finished = True
                 self._cond.notify_all()
 
+    def _size(self) -> int:
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return 0
+
     @staticmethod
     def _describe(exc: Exception) -> str:
-        status = getattr(exc, "status", None)
-        if status == 403:
-            return "the site refused the audio download too (HTTP 403)"
-        if status:
-            return f"the audio download failed (HTTP {status})"
-        return f"the audio download failed ({type(exc).__name__}: {str(exc)[:120]})"
+        text = str(exc)
+        if "403" in text:
+            return "YouTube refused the audio download (HTTP 403)"
+        if isinstance(exc, yt_dlp.utils.YoutubeDLError):
+            return str(_friendly_error(exc))
+        return f"the audio download failed ({type(exc).__name__}: {text[:120]})"
 
     # -- file-like API for discord.py (called from its writer thread) ---------------
     def read(self, n: int = -1) -> bytes:
         self.start()
         n = n if n and n > 0 else self.BLOCK
         with self._cond:
-            while not self._closed and self._read_pos >= self._written and not self._finished:
-                self._cond.wait(1.0)
-            if self._closed or self._read_pos >= self._written:
-                self._close_reader()
-                return b""  # finished (or failed: see .error)
-            available = self._written - self._read_pos
+            while True:
+                if self._closed:
+                    self._close_reader()
+                    return b""
+                available = self._size() - self._read_pos
+                if available > 0:
+                    break
+                if self._finished:
+                    self._close_reader()
+                    return b""  # finished (or failed: see .error)
+                self._cond.wait(0.1)
         try:
             if self._reader is None:
                 self._reader = open(self.path, "rb")
@@ -857,6 +836,35 @@ def describe_ffmpeg_error(stderr: str) -> str:
     return hint
 
 
+class _FFmpegPCMAudio(discord.FFmpegPCMAudio):
+    """discord.py 2.7.1's pipe writer crashes (AttributeError on a cleared stdin) when a song
+    is stopped while it waits for data. Same logic, but it checks for that."""
+
+    def _pipe_writer(self, source) -> None:  # type: ignore[override]
+        while self._process:
+            data = source.read(self.BLOCKSIZE)
+            stdin = self._stdin
+            if not data:
+                if stdin:  # discord's MISSING placeholder is falsy
+                    try:
+                        stdin.close()
+                    except Exception:
+                        pass
+                return
+            if not stdin:
+                return
+            try:
+                stdin.write(data)
+            except Exception:
+                process = self._process
+                if process:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                return
+
+
 def build_source(
     track: Track,
     *,
@@ -895,7 +903,7 @@ def build_source(
     if audio_filter.ffmpeg:
         options += ["-af", audio_filter.ffmpeg]
 
-    source = discord.FFmpegPCMAudio(
+    source = _FFmpegPCMAudio(
         pipe if pipe is not None else source_path,  # type: ignore[arg-type]
         executable=ffmpeg,
         pipe=pipe is not None,

@@ -62,7 +62,7 @@ class Music(commands.Cog):
     def _load_state(self) -> set[str]:
         try:
             data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            sources = {str(s) for s in data.get("download_sources", [])}
+            sources = {str(s) for s in data.get("download_first_v2", [])}
             if sources:
                 log.info("Remembered from last time: download songs from %s before playing.", ", ".join(sorted(sources)))
             return sources
@@ -77,7 +77,7 @@ class Music(commands.Cog):
         log.warning("Streaming from %s doesn't work on this connection, so the bot will download %s songs "
                     "first from now on (saved in %s; delete that file to undo).", source, source, STATE_FILE.name)
         try:
-            STATE_FILE.write_text(json.dumps({"download_sources": sorted(self.download_sources)}), encoding="utf-8")
+            STATE_FILE.write_text(json.dumps({"download_first_v2": sorted(self.download_sources)}), encoding="utf-8")
         except OSError:
             pass
 
