@@ -49,6 +49,13 @@ def _int(name: str, default: int, lo: int | None = None, hi: int | None = None) 
     return value
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on", "y"}
+
+
 def _color(raw: str, default: int) -> int:
     raw = raw.strip().lstrip("#")
     if not raw:
@@ -65,6 +72,7 @@ class Config:
     guild_id: int | None
     default_volume: int
     idle_timeout: int
+    leave_when_done: bool
     max_queue_size: int
     cookies_file: str | None
     cookies_from_browser: str | None
@@ -103,6 +111,7 @@ def load_config() -> Config:
         guild_id=guild_id,
         default_volume=_int("DEFAULT_VOLUME", 80, 0, 200),
         idle_timeout=_int("IDLE_TIMEOUT", 300, 10),
+        leave_when_done=_bool("LEAVE_WHEN_DONE", True),
         max_queue_size=_int("MAX_QUEUE_SIZE", 500, 1),
         cookies_file=cookies_file,
         cookies_from_browser=os.environ.get("COOKIES_FROM_BROWSER", "").strip() or None,

@@ -11,8 +11,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..audio import FILTERS, ExtractionError, Extractor, Track, ensure_opus, find_ffmpeg, format_duration, is_url, parse_timestamp
+from ..audio import FILTERS, ExtractionError, Extractor, Track, find_ffmpeg, format_duration, is_url, parse_timestamp
 from ..config import Config
+from ..diagnostics import build_report, install_drop_counter, log_startup_checks
 from ..musicqueue import LoopMode, QueueFull
 from ..player import GuildPlayer
 from ..ui import (
@@ -50,7 +51,8 @@ class Music(commands.Cog):
         self._ac_cache: OrderedDict[str, list[Track]] = OrderedDict()
         log.info("Using FFmpeg: %s", self.ffmpeg)
         log.info("Using JavaScript runtime for YouTube: %s", ", ".join(self.extractor.js_runtimes))
-        ensure_opus()
+        install_drop_counter()
+        log_startup_checks()
 
     async def cog_unload(self) -> None:
         for player in list(self.players.values()):
@@ -464,7 +466,7 @@ class Music(commands.Cog):
         await self.reply(interaction, f"♾️ Autoplay is now **{'on' if player.autoplay else 'off'}**.")
         await self.refresh_panel(player)
 
-    @app_commands.command(description="24/7 mode: stay in the voice channel even when idle")
+    @app_commands.command(description="24/7 mode: stay in the voice channel when the music ends")
     @app_commands.describe(enabled="On or off. Leave empty to toggle.")
     async def stay(self, interaction: discord.Interaction, enabled: Optional[bool] = None) -> None:
         player = self.get_controllable(interaction)
@@ -473,8 +475,17 @@ class Music(commands.Cog):
         if player.stay:
             await self.reply(interaction, "🕒 24/7 mode **on**: I'll stay in the channel until you `/leave`.")
         else:
-            await self.reply(interaction, "🕒 24/7 mode **off**: I'll leave when idle.")
+            when = "when the music ends" if self.config.leave_when_done else "when idle"
+            await self.reply(interaction, f"🕒 24/7 mode **off**: I'll leave {when}.")
         await self.refresh_panel(player)
+
+    @app_commands.command(description="Find out why there's no sound (checks the whole audio chain)")
+    async def diagnose(self, interaction: discord.Interaction) -> None:
+        member = self._member(interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        player = self.players.get(member.guild.id)
+        embed = await build_report(player, self.ffmpeg, self.color)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="help", description="Show all music commands")
     async def help_(self, interaction: discord.Interaction) -> None:

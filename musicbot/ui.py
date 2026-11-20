@@ -225,7 +225,8 @@ HELP_SECTIONS = {
     ],
     "🔌 Voice": [
         ("/join • /leave • /stop", "Join your channel, leave, or stop and clear"),
-        ("/stay", "24/7 mode: never leave because of inactivity"),
+        ("/stay", "24/7 mode: stay in the channel when the music ends"),
+        ("/diagnose", "No sound? This checks the whole audio chain and tells you why"),
     ],
 }
 

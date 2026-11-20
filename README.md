@@ -4,11 +4,11 @@ A music bot you run on your own PC. Paste a YouTube link, a playlist, or just ty
 
 - **No API keys and no extra servers.** The only thing you need is your Discord bot token.
 - Plays **YouTube** (videos, playlists, Shorts, YouTube Music), **SoundCloud**, **Bandcamp**, direct MP3 links and [1000+ other sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
-- **25 slash commands**, with live YouTube search suggestions as you type in `/play`.
+- **26 slash commands**, with live YouTube search suggestions as you type in `/play`.
 - **Live Now Playing panel**: 🔴 progress bar · ⏮️ ⏯️ ⏭️ ⏹️ 🔁 · 🔉 🔊 🔀 📜 ♾️ · 🎛️ filter menu.
 - **Audio filters**: Bass Boost, Nightcore, Vaporwave, Slowed + Reverb, 8D, Karaoke, Treble, Lo-Fi.
 - **Autoplay**: when the queue runs out, it keeps going with similar songs.
-- Pauses by itself when everyone leaves the voice channel, resumes when someone comes back, and leaves after a while. **24/7 mode** keeps it in the channel.
+- Leaves the voice channel when the queue is finished. It also pauses by itself when everyone leaves, resumes when someone comes back, and leaves after a while. **24/7 mode** keeps it in the channel.
 - Works on **Windows, macOS and Linux**. FFmpeg comes bundled, so there's nothing extra to install by hand.
 
 ---
@@ -138,8 +138,9 @@ Only people in the bot's voice channel can use the buttons. The panel always mov
 | `/volume [0-200]` | Set the volume (100% = original) |
 | `/filter <effect>` | Bass Boost, Nightcore, Vaporwave, Slowed + Reverb, 8D, Karaoke, Treble, Lo-Fi, Off |
 | `/autoplay [on/off]` | Keep playing similar songs when the queue ends |
-| `/stay [on/off]` | 24/7 mode: never leave because of inactivity |
+| `/stay [on/off]` | 24/7 mode: stay in the channel when the music ends |
 | `/join`, `/leave` | Join your voice channel / leave |
+| `/diagnose` | No sound? Checks the whole audio chain and tells you what's wrong |
 | `/help` | Show all commands |
 
 ---
@@ -151,7 +152,8 @@ Only people in the bot's voice channel can use the buttons. The panel always mov
 | `DISCORD_TOKEN` | *(required)* | Your bot token |
 | `GUILD_ID` | *(empty)* | Your server ID. Slash command changes show up instantly there. |
 | `DEFAULT_VOLUME` | `80` | Starting volume (0-200) |
-| `IDLE_TIMEOUT` | `300` | Seconds before leaving when idle or when everyone left |
+| `LEAVE_WHEN_DONE` | `true` | Leave the voice channel as soon as the queue is finished (`/stay` overrides it) |
+| `IDLE_TIMEOUT` | `300` | Seconds before leaving when everyone left (or when idle, if `LEAVE_WHEN_DONE=false`) |
 | `MAX_QUEUE_SIZE` | `500` | Maximum songs in the queue |
 | `EMBED_COLOR` | `#8B5CF6` | Color of the bot's messages |
 | `COOKIES_FILE` | *(empty)* | YouTube cookies file (see below) |
@@ -175,7 +177,10 @@ This rarely happens on a home internet connection, but if it does, give the bot 
 Using a spare Google account for this is a good idea. Never share your cookies file.
 
 **The bot joins but there's no sound.**
-Make sure the bot has the **Connect** and **Speak** permissions in that channel and isn't server-muted. If the console says *"The Opus audio library was not found"*, install it: `brew install opus` (macOS) or `sudo apt install libopus0` (Linux). On Replit, `replit.nix` already handles this.
+Run **`/diagnose`** while a song is playing. It checks every step of the audio chain and tells you exactly what's wrong.
+Common causes:
+- **Old setup:** `davey` version 0.2 with discord.py 2.7.1 makes the bot play silence. `requirements.txt` now pins `davey<0.2`, and restarting with the start script or Replit's Run button installs the right version.
+- **Other causes:** Make sure the bot has the **Connect** and **Speak** permissions in that channel and isn't server-muted. If the console says *"The Opus audio library was not found"*, install it: `brew install opus` (macOS) or `sudo apt install libopus0` (Linux). On Replit, `replit.nix` already handles this.
 
 **YouTube suddenly stopped working.**
 YouTube changes things often. Restart the bot: the start script automatically updates `yt-dlp`, which usually fixes it.

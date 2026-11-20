@@ -58,6 +58,7 @@ class GuildPlayer:
         self._speed = 1.0
         self._auto_paused = False
         self._alone_task: asyncio.Task | None = None
+        self._leave_reason: str | None = None
         self.destroyed = False
 
         self.panel = NowPlayingPanel(self)
@@ -252,7 +253,7 @@ class GuildPlayer:
             while not self.destroyed:
                 track = await self._next_track()
                 if track is None:
-                    reason = "💤 Left the voice channel after being idle. Use `/play` to bring me back!"
+                    reason = self._leave_reason or "💤 Left the voice channel after being idle. Use `/play` to bring me back!"
                     break
                 await self._play(track)
         except asyncio.CancelledError:
@@ -274,6 +275,11 @@ class GuildPlayer:
                 if related:
                     self.queue.add([related])
                     continue
+
+            if self.config.leave_when_done and not self.stay and self.last_played is not None:
+                # The queue is done: leave right away (24/7 mode keeps the bot in the channel).
+                self._leave_reason = "✅ Finished playing, so I left the voice channel. Use `/play` to bring me back!"
+                return None
 
             await self.panel.show_idle()
             timeout = None if self.stay else self.config.idle_timeout

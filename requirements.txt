@@ -1,5 +1,8 @@
 # Discord library with voice support (includes DAVE voice encryption, which Discord now requires)
 discord.py[voice]>=2.7.1
+# Voice encryption (DAVE). Must stay below 0.2: davey 0.2 changed how key changes work and
+# discord.py 2.7.1 doesn't support that yet, which makes the bot play silence.
+davey>=0.1.6,<0.2
 # Finds and streams music from YouTube, SoundCloud, Bandcamp and 1000+ sites.
 # The "deno" extra installs the JavaScript runtime YouTube now needs.
 yt-dlp[default,deno]>=2026.10.26
